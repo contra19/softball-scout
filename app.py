@@ -94,20 +94,28 @@ def parse_game_csv(csv_content: bytes) -> Tuple[List[PlayerGameStats], List[str]
     fieldnames = reader.fieldnames or []
     
     # Try to find columns (case-insensitive)
+    # First try exact match, then substring match
     def find_column(options: List[str]) -> Optional[str]:
+        # First: exact match (case-insensitive)
         for opt in options:
             for field in fieldnames:
-                if opt.lower() in field.lower():
+                if opt.lower() == field.lower().strip():
                     return field
+        # Second: substring match for longer option strings only
+        for opt in options:
+            if len(opt) > 2:  # Only do substring for longer strings
+                for field in fieldnames:
+                    if opt.lower() in field.lower():
+                        return field
         return None
-    
+
     name_col = find_column(['player', 'name'])
     ab_col = find_column(['ab', 'at bat'])
-    r_col = find_column(['r', 'run'])
-    h_col = find_column(['h', 'hit'])
+    r_col = find_column(['r', 'runs', 'run'])
+    h_col = find_column(['h', 'hits', 'hit'])
     rbi_col = find_column(['rbi'])
-    bb_col = find_column(['bb', 'walk'])
-    so_col = find_column(['so', 'k', 'strikeout'])
+    bb_col = find_column(['bb', 'walk', 'walks'])
+    so_col = find_column(['so', 'k', 'strikeout', 'strikeouts'])
     
     if not name_col:
         warnings.append("Could not find Player/Name column")
