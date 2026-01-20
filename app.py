@@ -37,10 +37,11 @@ st.set_page_config(
 # AUTHENTICATION
 # =============================================================================
 
-# Cookie manager for persistent login
-@st.cache_resource
 def get_cookie_manager():
-    return stx.CookieManager()
+    """Get or create the cookie manager instance in session state."""
+    if "cookie_manager" not in st.session_state:
+        st.session_state.cookie_manager = stx.CookieManager()
+    return st.session_state.cookie_manager
 
 def generate_auth_token(password: str) -> str:
     """Generate a hash token for the password to store in cookie."""
@@ -890,8 +891,8 @@ def render_setup():
     """Setup page for managing age groups, teams, imports, and exports"""
     st.title("⚙️ Setup & Data")
 
-    tab1, tab2, tab3, tab4, tab5 = st.tabs([
-        "Age Groups", "Our Teams", "Import Excel", "Import GameChanger", "Export"
+    tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
+        "Age Groups", "Our Teams", "Import Excel", "Import GameChanger", "Export", "Database"
     ])
 
     with tab1:
@@ -908,6 +909,9 @@ def render_setup():
 
     with tab5:
         render_export()
+
+    with tab6:
+        render_database_management()
 
 
 def render_age_groups_setup():
@@ -1197,6 +1201,57 @@ def render_export():
             file_name=filename,
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
         )
+
+
+def render_database_management():
+    """Database management - view stats and reset"""
+    st.subheader("Database Management")
+
+    # Show current database stats
+    stats = db.get_database_stats()
+
+    st.write("**Current Database Contents:**")
+    col1, col2, col3, col4 = st.columns(4)
+    with col1:
+        st.metric("Age Groups", stats['age_groups'])
+        st.metric("Teams", stats['teams'])
+    with col2:
+        st.metric("Seasons", stats['seasons'])
+        st.metric("Games", stats['games'])
+    with col3:
+        st.metric("Players", stats['players'])
+    with col4:
+        st.metric("Batting Records", stats['batting_stats'])
+        st.metric("Pitching Records", stats['pitching_stats'])
+
+    st.divider()
+
+    # Reset database section
+    st.write("**Reset Database**")
+    st.warning("This will permanently delete ALL data including teams, seasons, games, and player stats. This cannot be undone!")
+
+    # Two-step confirmation
+    if st.session_state.get('confirm_reset_step1'):
+        st.error("Are you absolutely sure? Type 'RESET' below and click confirm to proceed.")
+        confirm_text = st.text_input("Type RESET to confirm:", key="reset_confirm_text")
+        col1, col2 = st.columns(2)
+        with col1:
+            if st.button("Confirm Reset", type="primary"):
+                if confirm_text == "RESET":
+                    db.reset_database()
+                    st.session_state.confirm_reset_step1 = False
+                    st.success("Database has been reset successfully!")
+                    st.rerun()
+                else:
+                    st.error("You must type 'RESET' exactly to confirm.")
+        with col2:
+            if st.button("Cancel"):
+                st.session_state.confirm_reset_step1 = False
+                st.rerun()
+    else:
+        if st.button("Reset Database", type="secondary"):
+            st.session_state.confirm_reset_step1 = True
+            st.rerun()
 
 
 # =============================================================================

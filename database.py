@@ -1444,5 +1444,33 @@ def get_team_all_seasons_top_pitchers(team_id: int, stat: str = 'era', limit: in
         return [dict(row) for row in rows]
 
 
+# =============================================================================
+# DATABASE MANAGEMENT
+# =============================================================================
+
+def reset_database():
+    """Completely reset the database by deleting the file and reinitializing.
+    WARNING: This permanently deletes ALL data!
+    """
+    import os
+    if DB_PATH.exists():
+        os.remove(DB_PATH)
+    init_database()
+
+
+def get_database_stats() -> Dict:
+    """Get statistics about the current database contents"""
+    with get_db() as conn:
+        stats = {}
+        stats['age_groups'] = conn.execute("SELECT COUNT(*) FROM age_groups").fetchone()[0]
+        stats['teams'] = conn.execute("SELECT COUNT(*) FROM our_teams").fetchone()[0]
+        stats['seasons'] = conn.execute("SELECT COUNT(*) FROM seasons").fetchone()[0]
+        stats['games'] = conn.execute("SELECT COUNT(*) FROM games WHERE opponent_name NOT LIKE '%Totals%'").fetchone()[0]
+        stats['players'] = conn.execute("SELECT COUNT(*) FROM players").fetchone()[0]
+        stats['batting_stats'] = conn.execute("SELECT COUNT(*) FROM batting_stats").fetchone()[0]
+        stats['pitching_stats'] = conn.execute("SELECT COUNT(*) FROM pitching_stats").fetchone()[0]
+        return stats
+
+
 # Initialize database on import
 init_database()
