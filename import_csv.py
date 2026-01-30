@@ -1,21 +1,20 @@
 """
-Import tool for GameChanger CSV exports
-Maps the obscure column names to our database schema
+Import tool for CSV batting stats
+Supports both GameChanger exports and standard CSV formats
 """
 
 import csv
 import re
-from typing import Dict, Optional
+from typing import Dict, Optional, List, Tuple
 from pathlib import Path
 from database import (
     get_or_create_player, create_game, add_batting_stats,
-    get_or_create_season, get_db
+    get_or_create_season, get_db, get_games_by_season
 )
 
 
-# GameChanger CSV column mapping
-# The column names are obscure but map to standard batting stats
-COLUMN_MAP = {
+# GameChanger CSV column mapping (obscure column names)
+GAMECHANGER_COLUMN_MAP = {
     'BoxScoreComponents__playerName': 'player_name',
     'ag-cell': 'ab',      # At Bats
     'ag-cell 2': 'r',     # Runs
@@ -24,6 +23,73 @@ COLUMN_MAP = {
     'ag-cell 5': 'bb',    # Walks (may be missing)
     'ag-cell 6': 'so',    # Strikeouts
 }
+
+# Standard CSV column mapping (common column name variations)
+STANDARD_COLUMN_MAP = {
+    # Player name variations
+    'player': 'player_name',
+    'player_name': 'player_name',
+    'name': 'player_name',
+    'playername': 'player_name',
+    # At bats
+    'ab': 'ab',
+    'atbats': 'ab',
+    'at_bats': 'ab',
+    # Runs
+    'r': 'r',
+    'runs': 'r',
+    # Hits
+    'h': 'h',
+    'hits': 'h',
+    # RBI
+    'rbi': 'rbi',
+    'rbis': 'rbi',
+    # Walks
+    'bb': 'bb',
+    'walks': 'bb',
+    'walk': 'bb',
+    # Strikeouts
+    'so': 'so',
+    'k': 'so',
+    'strikeouts': 'so',
+    'strikeout': 'so',
+    # HBP
+    'hbp': 'hbp',
+    'hitbypitch': 'hbp',
+    # Sacrifice
+    'sac': 'sac',
+    'sacrifice': 'sac',
+}
+
+
+def detect_csv_format(headers: List[str]) -> Tuple[str, Dict[str, str]]:
+    """
+    Detect whether this is a GameChanger CSV or standard format.
+    Returns (format_type, column_mapping)
+    """
+    headers_lower = [h.lower().strip() for h in headers]
+
+    # Check for GameChanger format
+    if 'BoxScoreComponents__playerName' in headers or 'ag-cell' in headers:
+        col_map = {}
+        for csv_col, our_col in GAMECHANGER_COLUMN_MAP.items():
+            if csv_col in headers:
+                col_map[csv_col] = our_col
+        return ('gamechanger', col_map)
+
+    # Check for standard format
+    col_map = {}
+    for csv_col, our_col in STANDARD_COLUMN_MAP.items():
+        # Find matching header (case-insensitive)
+        for i, h in enumerate(headers_lower):
+            if h == csv_col:
+                col_map[headers[i]] = our_col  # Use original case
+                break
+
+    if col_map:
+        return ('standard', col_map)
+
+    return ('unknown', {})
 
 
 def parse_filename_for_game_info(filename: str) -> Dict:
@@ -81,7 +147,7 @@ def import_gamechanger_csv(
     verbose: bool = True
 ) -> Dict:
     """
-    Import a GameChanger batting stats CSV file.
+    Import a batting stats CSV file (GameChanger or standard format).
 
     Args:
         file_path: Path to the CSV file
@@ -130,45 +196,78 @@ def import_gamechanger_csv(
         results['errors'].append("CSV file is empty")
         return results
 
-    # Detect column mapping based on what's in the header
-    header = rows[0].keys() if rows else []
-    col_map = {}
-    for csv_col, our_col in COLUMN_MAP.items():
-        if csv_col in header:
-            col_map[csv_col] = our_col
+    # Detect CSV format and get column mapping
+    headers = list(rows[0].keys()) if rows else []
+    format_type, col_map = detect_csv_format(headers)
+
+    if format_type == 'unknown' or not col_map:
+        results['errors'].append(f"Could not detect CSV format. Headers found: {headers}")
+        return results
+
+    # Build reverse mapping: our_col -> csv_col
+    reverse_map = {v: k for k, v in col_map.items()}
 
     if verbose:
-        print(f"  Detected columns: {list(col_map.values())}")
+        print(f"  Detected format: {format_type}")
+        print(f"  Mapped columns: {list(col_map.values())}")
 
-    # Calculate team totals for runs
-    total_runs = sum(safe_int(row.get('ag-cell 2', 0)) for row in rows)
+    # Find the column name for runs to calculate total
+    runs_col = reverse_map.get('r')
+    total_runs = sum(safe_int(row.get(runs_col, 0)) for row in rows) if runs_col else 0
 
-    # Create the game
-    game_id = create_game(
-        season_id=season_id,
-        game_date=game_date,
-        opponent_name=opponent,
-        runs_for=total_runs,
-        notes=f"Imported from GameChanger: {Path(file_path).name}"
-    )
+    # Check if a game already exists for this date and opponent
+    # (e.g., from Excel import which has W/L and scores)
+    existing_games = get_games_by_season(season_id)
+    game_id = None
+
+    # Look for matching game by date and similar opponent name
+    for game in existing_games:
+        if game.game_date == game_date:
+            # Check if opponent names are similar (fuzzy match)
+            existing_opp = game.opponent_name.lower().replace(' ', '')
+            new_opp = opponent.lower().replace(' ', '')
+            # Match if one contains the other or they share significant overlap
+            if existing_opp in new_opp or new_opp in existing_opp:
+                game_id = game.id
+                if verbose:
+                    print(f"  Found existing game: {game.game_date} vs {game.opponent_name}")
+                break
+
+    if not game_id:
+        # Create a new game
+        game_id = create_game(
+            season_id=season_id,
+            game_date=game_date,
+            opponent_name=opponent,
+            runs_for=total_runs,
+            notes=f"Imported from CSV ({format_type}): {Path(file_path).name}"
+        )
+        if verbose:
+            print(f"  Created new game: {game_date} vs {opponent}")
+
     results['game_id'] = game_id
 
-    # Import each player's stats
+    # Import each player's stats using the detected column mapping
+    player_col = reverse_map.get('player_name')
+
     for row in rows:
-        player_name = row.get('BoxScoreComponents__playerName', '').strip()
+        # Get player name using detected column
+        player_name = row.get(player_col, '').strip() if player_col else ''
         if not player_name:
             continue
 
         # Get or create player
         player_id = get_or_create_player(player_name)
 
-        # Extract stats
-        ab = safe_int(row.get('ag-cell', 0))
-        r = safe_int(row.get('ag-cell 2', 0))
-        h = safe_int(row.get('ag-cell 3', 0))
-        rbi = safe_int(row.get('ag-cell 4', 0))
-        bb = safe_int(row.get('ag-cell 5', 0))  # May be 0 if column missing
-        so = safe_int(row.get('ag-cell 6', 0))
+        # Extract stats using the reverse mapping
+        ab = safe_int(row.get(reverse_map.get('ab', ''), 0))
+        r = safe_int(row.get(reverse_map.get('r', ''), 0))
+        h = safe_int(row.get(reverse_map.get('h', ''), 0))
+        rbi = safe_int(row.get(reverse_map.get('rbi', ''), 0))
+        bb = safe_int(row.get(reverse_map.get('bb', ''), 0))
+        so = safe_int(row.get(reverse_map.get('so', ''), 0))
+        hbp = safe_int(row.get(reverse_map.get('hbp', ''), 0))
+        sac = safe_int(row.get(reverse_map.get('sac', ''), 0))
 
         # Add batting stats
         add_batting_stats(
@@ -179,7 +278,9 @@ def import_gamechanger_csv(
             h=h,
             rbi=rbi,
             bb=bb,
-            so=so
+            so=so,
+            hbp=hbp,
+            sac=sac
         )
         results['stats_imported'] += 1
 

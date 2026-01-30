@@ -93,6 +93,7 @@ def init_database():
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 season_id INTEGER NOT NULL,
                 game_date TEXT NOT NULL,
+                game_time TEXT,
                 opponent_name TEXT NOT NULL,
                 opponent_team_id INTEGER,
                 win_loss TEXT CHECK(win_loss IN ('W', 'L', 'T')),
@@ -102,7 +103,7 @@ def init_database():
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 FOREIGN KEY (season_id) REFERENCES seasons(id),
                 FOREIGN KEY (opponent_team_id) REFERENCES teams(id),
-                UNIQUE(season_id, game_date, opponent_name, runs_for, runs_against)
+                UNIQUE(season_id, game_date, game_time, opponent_name)
             );
 
             -- Batting stats (per player per game)
@@ -231,6 +232,7 @@ class Game:
     season_id: int
     game_date: str
     opponent_name: str
+    game_time: Optional[str] = None
     opponent_team_id: Optional[int] = None
     win_loss: Optional[str] = None
     runs_for: Optional[int] = None
@@ -246,7 +248,9 @@ class Game:
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> 'Game':
         return cls(id=row['id'], season_id=row['season_id'], game_date=row['game_date'],
-                   opponent_name=row['opponent_name'], opponent_team_id=row['opponent_team_id'],
+                   opponent_name=row['opponent_name'],
+                   game_time=row['game_time'] if 'game_time' in row.keys() else None,
+                   opponent_team_id=row['opponent_team_id'],
                    win_loss=row['win_loss'], runs_for=row['runs_for'],
                    runs_against=row['runs_against'], notes=row['notes'])
 
@@ -600,36 +604,63 @@ def get_or_create_player(name: str, jersey_number: str = None) -> int:
 # =============================================================================
 
 def get_games_by_season(season_id: int) -> List[Game]:
-    """Get all games for a season"""
+    """Get all games for a season, sorted chronologically"""
     with get_db() as conn:
-        rows = conn.execute(
-            "SELECT * FROM games WHERE season_id = ? ORDER BY game_date",
-            (season_id,)
-        ).fetchall()
+        # Sort by parsing the month/day from game_date (format: "M/D")
+        # This sorts chronologically within a season
+        rows = conn.execute("""
+            SELECT * FROM games
+            WHERE season_id = ?
+            ORDER BY
+                CAST(SUBSTR(game_date, 1, INSTR(game_date, '/') - 1) AS INTEGER),
+                CAST(SUBSTR(game_date, INSTR(game_date, '/') + 1) AS INTEGER)
+        """, (season_id,)).fetchall()
         return [Game.from_row(row) for row in rows]
 
 
 def get_all_games_for_team(team_id: int) -> List[Game]:
-    """Get all games across all seasons for a specific team"""
+    """Get all games across all seasons for a specific team, sorted chronologically"""
     with get_db() as conn:
+        # Sort by year from season, then by month/day from game_date
+        # For Fall seasons, dates after August are in the same year, Jan-May are next year
+        # For Spring seasons, all dates are in the same year
         rows = conn.execute("""
             SELECT g.* FROM games g
             JOIN seasons s ON g.season_id = s.id
             WHERE s.team_id = ? AND g.opponent_name NOT LIKE '%Totals%'
-            ORDER BY g.game_date DESC
+            ORDER BY
+                s.year DESC,
+                CASE s.season_type WHEN 'Fall' THEN 1 WHEN 'Spring' THEN 2 END,
+                CASE
+                    WHEN s.season_type = 'Fall' AND CAST(SUBSTR(g.game_date, 1, INSTR(g.game_date, '/') - 1) AS INTEGER) < 6
+                    THEN 1  -- Jan-May games in Fall season come after Aug-Dec
+                    ELSE 0
+                END,
+                CAST(SUBSTR(g.game_date, 1, INSTR(g.game_date, '/') - 1) AS INTEGER),
+                CAST(SUBSTR(g.game_date, INSTR(g.game_date, '/') + 1) AS INTEGER)
         """, (team_id,)).fetchall()
         return [Game.from_row(row) for row in rows]
 
 
 def get_all_games_for_age_group(age_group_id: int) -> List[Game]:
-    """Get all games across all teams in an age group"""
+    """Get all games across all teams in an age group, sorted chronologically"""
     with get_db() as conn:
+        # Sort by year from season, then by month/day from game_date
         rows = conn.execute("""
             SELECT g.* FROM games g
             JOIN seasons s ON g.season_id = s.id
             JOIN our_teams ot ON s.team_id = ot.id
             WHERE ot.age_group_id = ? AND g.opponent_name NOT LIKE '%Totals%'
-            ORDER BY g.game_date DESC
+            ORDER BY
+                s.year DESC,
+                CASE s.season_type WHEN 'Fall' THEN 1 WHEN 'Spring' THEN 2 END,
+                CASE
+                    WHEN s.season_type = 'Fall' AND CAST(SUBSTR(g.game_date, 1, INSTR(g.game_date, '/') - 1) AS INTEGER) < 6
+                    THEN 1  -- Jan-May games in Fall season come after Aug-Dec
+                    ELSE 0
+                END,
+                CAST(SUBSTR(g.game_date, 1, INSTR(g.game_date, '/') - 1) AS INTEGER),
+                CAST(SUBSTR(g.game_date, INSTR(g.game_date, '/') + 1) AS INTEGER)
         """, (age_group_id,)).fetchall()
         return [Game.from_row(row) for row in rows]
 
@@ -642,23 +673,24 @@ def get_game(game_id: int) -> Optional[Game]:
 
 
 def create_game(season_id: int, game_date: str, opponent_name: str,
-                win_loss: str = None, runs_for: int = None, runs_against: int = None,
-                opponent_team_id: int = None, notes: str = None) -> int:
-    """Create or update a game (upserts based on season, date, opponent, score), returns ID"""
+                game_time: Optional[str] = None, win_loss: Optional[str] = None,
+                runs_for: Optional[int] = None, runs_against: Optional[int] = None,
+                opponent_team_id: Optional[int] = None, notes: Optional[str] = None) -> int:
+    """Create or update a game (upserts based on season, date, time, opponent), returns ID"""
     with get_db() as conn:
-        # Check if game already exists for this season, date, opponent, and score
-        # Include runs_for and runs_against to handle doubleheaders (same day, same opponent, different scores)
-        if runs_for is not None and runs_against is not None:
+        # Check if game already exists for this season, date, time, and opponent
+        # game_time helps distinguish double-headers on the same day
+        if game_time:
             existing = conn.execute("""
                 SELECT id FROM games
-                WHERE season_id = ? AND game_date = ? AND opponent_name = ?
-                  AND runs_for = ? AND runs_against = ?
-            """, (season_id, game_date, opponent_name, runs_for, runs_against)).fetchone()
+                WHERE season_id = ? AND game_date = ? AND game_time = ? AND opponent_name = ?
+            """, (season_id, game_date, game_time, opponent_name)).fetchone()
         else:
-            # For games without scores (like "Season Totals"), match on season+date+opponent
+            # Without time, match on season+date+opponent
             existing = conn.execute("""
                 SELECT id FROM games
                 WHERE season_id = ? AND game_date = ? AND opponent_name = ?
+                  AND (game_time IS NULL OR game_time = '')
             """, (season_id, game_date, opponent_name)).fetchone()
 
         if existing:
@@ -668,29 +700,97 @@ def create_game(season_id: int, game_date: str, opponent_name: str,
                                  runs_for = COALESCE(?, runs_for),
                                  runs_against = COALESCE(?, runs_against),
                                  opponent_team_id = COALESCE(?, opponent_team_id),
-                                 notes = COALESCE(?, notes)
+                                 notes = COALESCE(?, notes),
+                                 game_time = COALESCE(?, game_time)
                 WHERE id = ?
-            """, (win_loss, runs_for, runs_against, opponent_team_id, notes, existing['id']))
+            """, (win_loss, runs_for, runs_against, opponent_team_id, notes, game_time, existing['id']))
             return existing['id']
         else:
             # Insert new game
             cursor = conn.execute("""
-                INSERT INTO games (season_id, game_date, opponent_name, opponent_team_id,
+                INSERT INTO games (season_id, game_date, game_time, opponent_name, opponent_team_id,
                                    win_loss, runs_for, runs_against, notes)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-            """, (season_id, game_date, opponent_name, opponent_team_id,
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (season_id, game_date, game_time, opponent_name, opponent_team_id,
                   win_loss, runs_for, runs_against, notes))
             return cursor.lastrowid
 
 
-def update_game(game_id: int, win_loss: str = None, runs_for: int = None,
-                runs_against: int = None) -> None:
-    """Update game results"""
+def update_game(game_id: int, game_date: Optional[str] = None, game_time: Optional[str] = None,
+                opponent_name: Optional[str] = None, win_loss: Optional[str] = None,
+                runs_for: Optional[int] = None, runs_against: Optional[int] = None) -> None:
+    """Update game information. Only updates fields that are explicitly passed."""
     with get_db() as conn:
-        conn.execute("""
-            UPDATE games SET win_loss = ?, runs_for = ?, runs_against = ?
-            WHERE id = ?
-        """, (win_loss, runs_for, runs_against, game_id))
+        # Build dynamic update query for provided fields
+        updates = []
+        params = []
+
+        if game_date is not None:
+            updates.append("game_date = ?")
+            params.append(game_date)
+        if game_time is not None:
+            updates.append("game_time = ?")
+            params.append(game_time)
+        if opponent_name is not None:
+            updates.append("opponent_name = ?")
+            params.append(opponent_name)
+        if win_loss is not None:
+            updates.append("win_loss = ?")
+            params.append(win_loss)
+        if runs_for is not None:
+            updates.append("runs_for = ?")
+            params.append(runs_for)
+        if runs_against is not None:
+            updates.append("runs_against = ?")
+            params.append(runs_against)
+
+        if updates:
+            params.append(game_id)
+            conn.execute(f"""
+                UPDATE games SET {', '.join(updates)}
+                WHERE id = ?
+            """, params)
+
+
+def update_batting_stats(batting_stats_id: int, ab: Optional[int] = None, r: Optional[int] = None,
+                         h: Optional[int] = None, rbi: Optional[int] = None, bb: Optional[int] = None,
+                         so: Optional[int] = None, hbp: Optional[int] = None, sac: Optional[int] = None) -> None:
+    """Update batting stats for a player in a game"""
+    with get_db() as conn:
+        updates = []
+        params = []
+
+        if ab is not None:
+            updates.append("ab = ?")
+            params.append(ab)
+        if r is not None:
+            updates.append("r = ?")
+            params.append(r)
+        if h is not None:
+            updates.append("h = ?")
+            params.append(h)
+        if rbi is not None:
+            updates.append("rbi = ?")
+            params.append(rbi)
+        if bb is not None:
+            updates.append("bb = ?")
+            params.append(bb)
+        if so is not None:
+            updates.append("so = ?")
+            params.append(so)
+        if hbp is not None:
+            updates.append("hbp = ?")
+            params.append(hbp)
+        if sac is not None:
+            updates.append("sac = ?")
+            params.append(sac)
+
+        if updates:
+            params.append(batting_stats_id)
+            conn.execute(f"""
+                UPDATE batting_stats SET {', '.join(updates)}
+                WHERE id = ?
+            """, params)
 
 
 def get_season_record(season_id: int) -> Tuple[int, int, int]:
@@ -1448,6 +1548,41 @@ def get_team_all_seasons_top_pitchers(team_id: int, stat: str = 'era', limit: in
 # DATABASE MANAGEMENT
 # =============================================================================
 
+def delete_totals_games():
+    """Delete all 'Season Totals' placeholder games from the database.
+    These were created to hold aggregated stats from Excel imports
+    but should not appear in the games list.
+    """
+    with get_db() as conn:
+        # First get the IDs of all Totals games
+        rows = conn.execute("""
+            SELECT id FROM games WHERE opponent_name LIKE '%Totals%'
+        """).fetchall()
+        game_ids = [row['id'] for row in rows]
+
+        if game_ids:
+            # Delete associated batting stats (CASCADE should handle this but being explicit)
+            conn.execute("""
+                DELETE FROM batting_stats WHERE game_id IN (
+                    SELECT id FROM games WHERE opponent_name LIKE '%Totals%'
+                )
+            """)
+
+            # Delete associated pitching stats
+            conn.execute("""
+                DELETE FROM pitching_stats WHERE game_id IN (
+                    SELECT id FROM games WHERE opponent_name LIKE '%Totals%'
+                )
+            """)
+
+            # Delete the games themselves
+            conn.execute("""
+                DELETE FROM games WHERE opponent_name LIKE '%Totals%'
+            """)
+
+        return len(game_ids)
+
+
 def reset_database():
     """Completely reset the database by deleting the file and reinitializing.
     WARNING: This permanently deletes ALL data!
@@ -1472,5 +1607,18 @@ def get_database_stats() -> Dict:
         return stats
 
 
+def migrate_database():
+    """Run database migrations to update schema for existing databases"""
+    with get_db() as conn:
+        # Check if game_time column exists
+        cursor = conn.execute("PRAGMA table_info(games)")
+        columns = [row[1] for row in cursor.fetchall()]
+
+        if 'game_time' not in columns:
+            conn.execute("ALTER TABLE games ADD COLUMN game_time TEXT")
+            print("Migration: Added game_time column to games table")
+
+
 # Initialize database on import
 init_database()
+migrate_database()
