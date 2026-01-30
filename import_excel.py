@@ -61,10 +61,13 @@ def parse_record(text: str) -> Tuple[int, int, int]:
 
 
 def clean_player_name(name: str) -> str:
-    """Remove handedness indicators and clean player name"""
+    """Remove handedness indicators and clean player name. Returns empty for headers."""
     if not name:
         return ""
     name = str(name).strip()
+    # Skip header row values
+    if name.upper() in ['PLAYER', 'NAME', 'PLAYERS', '#', '']:
+        return ""
     # Remove (R), (L), (S) suffix
     name = re.sub(r'\s*\([RLS]\)\s*$', '', name)
     return name.strip()
@@ -84,10 +87,30 @@ def format_jersey(val) -> Optional[str]:
     """Format jersey number as whole number string, or None if invalid"""
     if val is None or val == '':
         return None
+    # Skip header row values
+    str_val = str(val).strip()
+    if str_val.upper() in ['#', 'NO', 'NO.', 'NUM', 'NUMBER', 'JERSEY']:
+        return None
     try:
         return str(int(float(val)))
     except (ValueError, TypeError):
-        return str(val).strip() if val else None
+        return str_val if str_val else None
+
+
+def is_header_or_invalid_player(name: str, jersey: any) -> bool:
+    """Check if a row appears to be a header row rather than actual player data"""
+    if not name:
+        return True
+    name_upper = str(name).strip().upper()
+    # Common header values for player name column
+    if name_upper in ['PLAYER', 'NAME', 'PLAYERS', 'TOTALS', '#', '']:
+        return True
+    # Check if jersey looks like a header
+    if jersey is not None:
+        jersey_str = str(jersey).strip().upper()
+        if jersey_str in ['#', 'NO', 'NO.', 'NUM', 'NUMBER', 'JERSEY']:
+            return True
+    return False
 
 
 def safe_float(val) -> float:
@@ -241,10 +264,12 @@ def import_fall_sheet(ws, team_id: int = None, verbose: bool = True) -> Dict:
             games.append((game_date, opponent, w_l, rf, ra))
 
         # Read pitching stats (columns G-W, player in H)
-        pitcher_name = clean_player_name(ws.cell(row=row, column=8).value)
-        if pitcher_name and pitcher_name.upper() != 'TOTALS':
+        pitcher_name_raw = ws.cell(row=row, column=8).value
+        pitcher_jersey_raw = ws.cell(row=row, column=7).value
+        pitcher_name = clean_player_name(pitcher_name_raw)
+        if pitcher_name and not is_header_or_invalid_player(pitcher_name_raw, pitcher_jersey_raw):
             pitching_players[pitcher_name] = {
-                'jersey': ws.cell(row=row, column=7).value,
+                'jersey': pitcher_jersey_raw,
                 'app': safe_int(ws.cell(row=row, column=9).value),
                 'ip': safe_float(ws.cell(row=row, column=10).value),
                 'h': safe_int(ws.cell(row=row, column=11).value),
@@ -257,10 +282,12 @@ def import_fall_sheet(ws, team_id: int = None, verbose: bool = True) -> Dict:
             }
 
         # Read batting stats (columns 25-33, player in column 26)
-        batter_name = clean_player_name(ws.cell(row=row, column=26).value)
-        if batter_name and batter_name.upper() not in ['TOTALS', 'PLAYER', '#']:
+        batter_name_raw = ws.cell(row=row, column=26).value
+        batter_jersey_raw = ws.cell(row=row, column=25).value
+        batter_name = clean_player_name(batter_name_raw)
+        if batter_name and not is_header_or_invalid_player(batter_name_raw, batter_jersey_raw):
             batting_players[batter_name] = {
-                'jersey': ws.cell(row=row, column=25).value,
+                'jersey': batter_jersey_raw,
                 'ab': safe_int(ws.cell(row=row, column=27).value),
                 'r': safe_int(ws.cell(row=row, column=28).value),
                 'h': safe_int(ws.cell(row=row, column=29).value),
@@ -289,7 +316,7 @@ def import_fall_sheet(ws, team_id: int = None, verbose: bool = True) -> Dict:
         print(f"  Found {len(batting_players)} batters")
         print(f"  Found {len(pitching_players)} pitchers")
 
-    # Create players
+    # Create players from the roster (we still want to know who's on the team)
     player_ids = {}
     for name in set(list(batting_players.keys()) + list(pitching_players.keys())):
         jersey = None
@@ -300,13 +327,10 @@ def import_fall_sheet(ws, team_id: int = None, verbose: bool = True) -> Dict:
 
         player_ids[name] = get_or_create_player(name, format_jersey(jersey))
 
-    # Import games and distribute stats proportionally
-    # Since the Excel has season totals, we'll create one "aggregated" game per player
-    # For a proper import, we'd need per-game data
-
-    # For now, create a summary game for the season totals
+    # Import games with just the game info (W/L, score, opponent)
+    # The Excel only has season totals for batting/pitching, not per-game stats
+    # Per-game batting stats should come from CSV imports
     if games:
-        # Create each game with just the game info
         for game_date, opponent, w_l, rf, ra in games:
             game_id = create_game(
                 season_id=season_id,
@@ -318,46 +342,14 @@ def import_fall_sheet(ws, team_id: int = None, verbose: bool = True) -> Dict:
             )
             results['games_imported'] += 1
 
-    # Create a "Season Totals" placeholder game for the aggregated stats
-    # This is a workaround since the Excel doesn't have per-game breakdowns
-    totals_game_id = create_game(
-        season_id=season_id,
-        game_date="Season",
-        opponent_name=f"{season_type} {year} Totals",
-        notes="Aggregated stats imported from Excel"
-    )
+    # NOTE: We no longer create "Season Totals" placeholder games.
+    # The Excel only has aggregated season stats, not per-game breakdowns.
+    # Per-game batting/pitching stats should be imported from CSV files.
+    # Season totals are calculated on-the-fly from per-game data.
 
-    # Add batting stats to the totals game
-    for name, stats in batting_players.items():
-        player_id = player_ids[name]
-        add_batting_stats(
-            game_id=totals_game_id,
-            player_id=player_id,
-            ab=stats['ab'],
-            r=stats['r'],
-            h=stats['h'],
-            rbi=stats['rbi'],
-            bb=stats['bb'],
-            so=stats['so']
-        )
-        results['batting_records'] += 1
-
-    # Add pitching stats to the totals game
-    for name, stats in pitching_players.items():
-        player_id = player_ids[name]
-        add_pitching_stats(
-            game_id=totals_game_id,
-            player_id=player_id,
-            ip=stats['ip'],
-            h=stats['h'],
-            r=stats['r'],
-            k=stats['k'],
-            bb=stats['bb'],
-            hbp=stats['hbp'],
-            pitches=stats['pitches'],
-            strikes=stats['strikes']
-        )
-        results['pitching_records'] += 1
+    if verbose:
+        print(f"  Note: Season batting/pitching totals not imported (Excel has aggregates only)")
+        print(f"  Import per-game stats from CSV files for accurate player stats")
 
     return results
 
@@ -447,10 +439,12 @@ def import_season_block(ws, start_row: int, end_row: int,
             games.append((game_date, opponent, w_l, rf, ra))
 
         # Read pitching stats
-        pitcher_name = clean_player_name(ws.cell(row=row, column=8).value)
-        if pitcher_name and pitcher_name.upper() not in ['TOTALS', 'PLAYER']:
+        pitcher_name_raw = ws.cell(row=row, column=8).value
+        pitcher_jersey_raw = ws.cell(row=row, column=7).value
+        pitcher_name = clean_player_name(pitcher_name_raw)
+        if pitcher_name and not is_header_or_invalid_player(pitcher_name_raw, pitcher_jersey_raw):
             pitching_players[pitcher_name] = {
-                'jersey': ws.cell(row=row, column=7).value,
+                'jersey': pitcher_jersey_raw,
                 'app': safe_int(ws.cell(row=row, column=9).value),
                 'ip': safe_float(ws.cell(row=row, column=10).value),
                 'h': safe_int(ws.cell(row=row, column=11).value),
@@ -463,10 +457,12 @@ def import_season_block(ws, start_row: int, end_row: int,
             }
 
         # Read batting stats (columns W-AE, player in X which is 24)
-        batter_name = clean_player_name(ws.cell(row=row, column=24).value)
-        if batter_name and batter_name.upper() not in ['TOTALS', 'PLAYER']:
+        batter_name_raw = ws.cell(row=row, column=24).value
+        batter_jersey_raw = ws.cell(row=row, column=23).value
+        batter_name = clean_player_name(batter_name_raw)
+        if batter_name and not is_header_or_invalid_player(batter_name_raw, batter_jersey_raw):
             batting_players[batter_name] = {
-                'jersey': ws.cell(row=row, column=23).value,
+                'jersey': batter_jersey_raw,
                 'ab': safe_int(ws.cell(row=row, column=25).value),
                 'r': safe_int(ws.cell(row=row, column=26).value),
                 'h': safe_int(ws.cell(row=row, column=27).value),
@@ -478,7 +474,7 @@ def import_season_block(ws, start_row: int, end_row: int,
     if verbose:
         print(f"  Found {len(games)} games, {len(batting_players)} batters, {len(pitching_players)} pitchers")
 
-    # Create players
+    # Create players from the roster
     player_ids = {}
     for name in set(list(batting_players.keys()) + list(pitching_players.keys())):
         jersey = None
@@ -488,7 +484,7 @@ def import_season_block(ws, start_row: int, end_row: int,
             jersey = pitching_players[name].get('jersey')
         player_ids[name] = get_or_create_player(name, format_jersey(jersey))
 
-    # Create games
+    # Create games with just game info (W/L, score, opponent)
     for game_date, opponent, w_l, rf, ra in games:
         create_game(
             season_id=season_id,
@@ -500,45 +496,11 @@ def import_season_block(ws, start_row: int, end_row: int,
         )
         results['games_imported'] += 1
 
-    # Create totals game for stats
-    totals_game_id = create_game(
-        season_id=season_id,
-        game_date="Season",
-        opponent_name=f"{season_type} {year} Totals",
-        notes="Aggregated stats imported from Excel"
-    )
+    # NOTE: We no longer create "Season Totals" placeholder games.
+    # Per-game batting/pitching stats should be imported from CSV files.
 
-    # Add batting stats
-    for name, stats in batting_players.items():
-        player_id = player_ids[name]
-        add_batting_stats(
-            game_id=totals_game_id,
-            player_id=player_id,
-            ab=stats['ab'],
-            r=stats['r'],
-            h=stats['h'],
-            rbi=stats['rbi'],
-            bb=stats['bb'],
-            so=stats['so']
-        )
-        results['batting_records'] += 1
-
-    # Add pitching stats
-    for name, stats in pitching_players.items():
-        player_id = player_ids[name]
-        add_pitching_stats(
-            game_id=totals_game_id,
-            player_id=player_id,
-            ip=stats['ip'],
-            h=stats['h'],
-            r=stats['r'],
-            k=stats['k'],
-            bb=stats['bb'],
-            hbp=stats['hbp'],
-            pitches=stats['pitches'],
-            strikes=stats['strikes']
-        )
-        results['pitching_records'] += 1
+    if verbose:
+        print(f"  Note: Season batting/pitching totals not imported (Excel has aggregates only)")
 
     return results
 
